@@ -40,6 +40,7 @@ export default function SignInPage() {
             <UnderwriteLogo />
           </div>
           <SignIn
+            forceRedirectUrl="/dashboard"
             appearance={{
               elements: {
                 rootBox: "w-full",

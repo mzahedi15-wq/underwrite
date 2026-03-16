@@ -46,6 +46,7 @@ export default function SignUpPage() {
             <UnderwriteLogo />
           </div>
           <SignUp
+            forceRedirectUrl="/dashboard"
             appearance={{
               elements: {
                 rootBox: "w-full",
