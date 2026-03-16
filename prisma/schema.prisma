@@ -1,0 +1,84 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum AnalysisStatus {
+  PENDING
+  PROCESSING
+  COMPLETE
+  FAILED
+}
+
+enum Verdict {
+  STRONG_BUY
+  BUY
+  HOLD
+  PASS
+}
+
+enum Plan {
+  FREE
+  STARTER
+  PRO
+  UNLIMITED
+}
+
+model User {
+  id        String   @id @default(cuid())
+  clerkId   String   @unique
+  email     String   @unique
+  firstName String?
+  lastName  String?
+  plan      Plan     @default(FREE)
+  analyses  Analysis[]
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Analysis {
+  id             String         @id @default(cuid())
+  userId         String
+  user           User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  propertyUrl    String
+  address        String?
+  city           String?
+  state          String?
+  zip            String?
+  listPrice      Int?
+  beds           Int?
+  baths          Float?
+  sqft           Int?
+
+  propertyType   String?
+  strategy       String?
+  renovationBudget Int?
+  notes          String?
+
+  status         AnalysisStatus @default(PENDING)
+  verdict        Verdict?
+
+  // Financial outputs
+  projRevenue    Int?
+  cocReturn      Float?
+  capRate        Float?
+  irr            Float?
+  occupancy      Float?
+  noi            Int?
+  adr            Int?
+
+  // Output documents (stored as JSON or S3 URLs)
+  reportJson     Json?
+  pitchDeckUrl   String?
+  financialModelUrl String?
+  renovationScopeUrl String?
+
+  startedAt      DateTime?
+  completedAt    DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+}
