@@ -24,9 +24,36 @@ export default function NewAnalysisPage() {
   const [targetRenovation, setTargetRenovation] = useState("");
   const [notes, setNotes] = useState("");
 
-  function handleSubmit(e: React.FormEvent) {
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
-    router.push("/processing/demo");
+    setSubmitting(true);
+    setError(null);
+    try {
+      const res = await fetch("/api/analyses", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          propertyUrl: url,
+          propertyType: propType,
+          strategy,
+          renovationBudget: targetRenovation || null,
+          notes: notes || null,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setError(data.error ?? "Something went wrong. Please try again.");
+        setSubmitting(false);
+        return;
+      }
+      router.push(`/processing/${data.id}`);
+    } catch {
+      setError("Network error. Please try again.");
+      setSubmitting(false);
+    }
   }
 
   return (
@@ -169,11 +196,15 @@ export default function NewAnalysisPage() {
           </div>
         </div>
 
+        {error && (
+          <p className="text-sm text-red-600 bg-red-50 border border-red-200 rounded-lg px-4 py-3">{error}</p>
+        )}
+
         {/* Submit */}
         <div className="flex items-center justify-between">
           <p className="text-xs text-[#6B6860]">Est. 12–18 minutes to complete</p>
-          <Button type="submit" size="lg" className="gap-2">
-            Start analysis <ArrowRight size={16} />
+          <Button type="submit" size="lg" className="gap-2" disabled={submitting}>
+            {submitting ? "Starting…" : "Start analysis"} <ArrowRight size={16} />
           </Button>
         </div>
       </form>
