@@ -1,14 +1,28 @@
-import { auth } from "@clerk/nextjs/server";
+import { auth, currentUser } from "@clerk/nextjs/server";
 import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
+
+async function getOrCreateUser(clerkId: string) {
+  const existing = await db.user.findUnique({ where: { clerkId } });
+  if (existing) return existing;
+
+  const clerkUser = await currentUser();
+  return db.user.create({
+    data: {
+      clerkId,
+      email: clerkUser?.emailAddresses[0]?.emailAddress ?? `${clerkId}@unknown`,
+      firstName: clerkUser?.firstName ?? null,
+      lastName: clerkUser?.lastName ?? null,
+    },
+  });
+}
 
 // GET /api/analyses — list current user's analyses
 export async function GET() {
   const { userId: clerkId } = await auth();
   if (!clerkId) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
-  const user = await db.user.findUnique({ where: { clerkId } });
-  if (!user) return NextResponse.json({ error: "User not found" }, { status: 404 });
+  const user = await getOrCreateUser(clerkId);
 
   const analyses = await db.analysis.findMany({
     where: { userId: user.id },
@@ -23,8 +37,7 @@ export async function POST(req: Request) {
   const { userId: clerkId } = await auth();
   if (!clerkId) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
-  const user = await db.user.findUnique({ where: { clerkId } });
-  if (!user) return NextResponse.json({ error: "User not found" }, { status: 404 });
+  const user = await getOrCreateUser(clerkId);
 
   // Enforce plan limits
   const now = new Date();
