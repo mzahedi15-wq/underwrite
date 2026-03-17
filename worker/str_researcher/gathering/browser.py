@@ -12,7 +12,14 @@ from playwright.async_api import (
     Playwright,
     async_playwright,
 )
-from playwright_stealth import Stealth
+try:
+    from playwright_stealth import Stealth
+except (ImportError, ModuleNotFoundError):
+    # playwright-stealth requires pkg_resources (setuptools) which may be absent
+    # in slim Python images. Fall back to a no-op so the worker still starts.
+    class Stealth:  # type: ignore[no-redef]
+        async def apply_stealth_async(self, page) -> None:
+            pass
 
 from str_researcher.utils.logging import get_logger
 from str_researcher.utils.rate_limiter import RateLimiter
