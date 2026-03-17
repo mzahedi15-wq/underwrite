@@ -1,17 +1,39 @@
 """
 Underwrite Analysis Pipeline
-Step-by-step orchestration using Claude claude-sonnet-4-6 + web scraping.
+Uses the full STR Researcher engine adapted for single-property analysis.
 """
 
-import asyncio
-import os
-import json
-import httpx
-import anthropic
-from typing import Optional
-from scraper import scrape_property, scrape_str_comps
+from __future__ import annotations
 
-client = anthropic.AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+import os
+import statistics
+from pathlib import Path
+from typing import Optional
+
+from str_researcher.analysis.ai_analyst import AIAnalyst
+from str_researcher.analysis.comps import CompAnalyzer
+from str_researcher.analysis.financial import FinancialAnalyzer
+from str_researcher.analysis.revenue import RevenueEstimator
+from str_researcher.analysis.scoring import InvestmentScorer
+from str_researcher.config import (
+    CostAssumptions,
+    FinancingConfig,
+    RegionConfig,
+    ScoringWeights,
+)
+from str_researcher.gathering.airbnb import AirbnbScraper
+from str_researcher.gathering.browser import BrowserManager
+from str_researcher.gathering.cache import ScraperCache
+from str_researcher.gathering.redfin import RedfinScraper
+from str_researcher.gathering.vrbo import VRBOScraper
+from str_researcher.gathering.zillow import ZillowScraper
+from str_researcher.models.comp import STRComp
+from str_researcher.models.property import PropertyListing
+from str_researcher.models.report import AnalysisResult
+from str_researcher.models.str_performance import (
+    DualRevenueEstimate,
+    MarketMetrics,
+)
 
 
 async def run_analysis_pipeline(
@@ -24,235 +46,343 @@ async def run_analysis_pipeline(
 ) -> dict:
     print(f"[{analysis_id}] Starting pipeline for {property_url}")
 
-    # ── Step 1: Scrape property listing ──────────────────────────────────
-    print(f"[{analysis_id}] Step 1: Scraping property data")
-    property_data = await scrape_property(property_url)
+    costs = CostAssumptions()
+    financing = FinancingConfig()
 
-    # ── Step 2: Pull STR comps ────────────────────────────────────────────
-    print(f"[{analysis_id}] Step 2: Pulling STR comps")
-    comps = await scrape_str_comps(
-        lat=property_data.get("lat"),
-        lon=property_data.get("lon"),
-        beds=property_data.get("beds", 3),
+    cache_path = Path(os.environ.get("CACHE_DIR", "/tmp")) / "str_cache.db"
+    async with ScraperCache(db_path=cache_path, ttl_hours=24) as cache:
+        async with BrowserManager() as browser:
+            # ── Step 1: Scrape property listing ──────────────────────────
+            print(f"[{analysis_id}] Step 1: Scraping property data")
+            prop = await _scrape_property(browser, cache, property_url)
+            if not prop:
+                raise ValueError(f"Failed to scrape property data from: {property_url}")
+            print(
+                f"[{analysis_id}] Property: {prop.address}, {prop.city}, {prop.state} "
+                f"— ${prop.list_price:,}, {prop.beds}bd/{prop.baths}ba"
+            )
+
+            # ── Step 2: Build region config from property lat/lng ─────────
+            region = _build_region_config(prop)
+
+            # ── Step 3: Scrape STR comps from Airbnb + VRBO ──────────────
+            print(f"[{analysis_id}] Step 2: Pulling STR comps")
+            str_comps = await _gather_str_comps(browser, cache, region)
+            print(f"[{analysis_id}] Found {len(str_comps)} STR comps")
+
+            # ── Step 4: Comp analysis & revenue estimation ────────────────
+            print(f"[{analysis_id}] Step 3: Analyzing comps and estimating revenue")
+            comp_analyzer = CompAnalyzer(top_percentile=0.90)
+            ranked_comps = comp_analyzer.rank_str_comps(str_comps)
+            amenity_matrix = comp_analyzer.build_amenity_matrix(ranked_comps)
+            top_10_revenue = comp_analyzer.get_top_10_pct_revenue(ranked_comps)
+
+            revenue_estimator = RevenueEstimator()
+            comp_estimate = revenue_estimator.estimate_from_comps(prop, ranked_comps)
+
+            market = _build_market_from_comps(ranked_comps, prop)
+
+            if comp_estimate is None:
+                print(f"[{analysis_id}] No close comp match — falling back to market estimate")
+                comp_estimate = revenue_estimator.estimate_from_market(prop, market)
+
+            dual_revenue = revenue_estimator.reconcile(None, comp_estimate, top_10_revenue)
+
+            # ── Step 5: Financial analysis ────────────────────────────────
+            print(f"[{analysis_id}] Step 4: Building financial model")
+            financial = FinancialAnalyzer(costs, financing)
+            investment_metrics = financial.build_all_scenarios(
+                prop,
+                dual_revenue,
+                market,
+                renovation_budget=float(renovation_budget) if renovation_budget else None,
+            )
+
+            # ── Step 6: Score ─────────────────────────────────────────────
+            result = AnalysisResult(
+                property=prop,
+                revenue_estimate=dual_revenue,
+                market_metrics=market,
+                investment_metrics=investment_metrics,
+                str_comps=ranked_comps,
+            )
+            scorer = InvestmentScorer(ScoringWeights())
+            result.investment_score = scorer.score_property(result)
+
+            # ── Step 7: AI analysis ───────────────────────────────────────
+            anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
+            if anthropic_key:
+                print(f"[{analysis_id}] Step 5: AI — scope of work + narrative")
+                try:
+                    ai = AIAnalyst(anthropic_key)
+                    top_comps = [c for c in ranked_comps if c.is_top_performer][:10]
+
+                    result.scope_of_work = await ai.generate_scope_of_work(
+                        prop, top_comps, amenity_matrix, market, dual_revenue
+                    )
+
+                    best_coc = max(
+                        (m.cash_on_cash_return for m in investment_metrics.values()),
+                        default=0,
+                    )
+                    best_cap = max(
+                        (m.cap_rate for m in investment_metrics.values()),
+                        default=0,
+                    )
+                    result.investment_narrative = await ai.generate_investment_narrative(
+                        prop, dual_revenue, market, best_coc, best_cap, result.investment_score
+                    )
+
+                    # Re-run financials with actual scope budget if available
+                    if result.scope_of_work and result.scope_of_work.total_budget_high > 0:
+                        scope_budget = (
+                            result.scope_of_work.total_budget_low
+                            + result.scope_of_work.total_budget_high
+                        ) / 2
+                        result.investment_metrics = financial.build_all_scenarios(
+                            prop, dual_revenue, market, renovation_budget=scope_budget
+                        )
+                        investment_metrics = result.investment_metrics
+                        result.investment_score = scorer.score_property(result)
+
+                except Exception as e:
+                    print(f"[{analysis_id}] AI analysis error (non-fatal): {e}")
+
+            print(
+                f"[{analysis_id}] Pipeline complete. Score: {result.investment_score:.0f}/100"
+            )
+            return _map_to_db_format(result)
+
+
+async def _scrape_property(
+    browser: BrowserManager,
+    cache: ScraperCache,
+    url: str,
+) -> Optional[PropertyListing]:
+    """Scrape a single property detail page from Zillow or Redfin."""
+    if "zillow.com" in url:
+        scraper = ZillowScraper(browser, cache)
+        return await scraper.scrape_detail_url(url)
+    elif "redfin.com" in url:
+        scraper = RedfinScraper(browser, cache)
+        return await scraper.scrape_detail_url(url)
+    else:
+        raise ValueError(f"Unsupported listing URL (expected zillow.com or redfin.com): {url}")
+
+
+def _build_region_config(prop: PropertyListing) -> RegionConfig:
+    """Build a RegionConfig from a property's coordinates for comp scraping."""
+    lat = prop.lat or 33.4484  # Phoenix fallback
+    lng = prop.lng or -112.0740
+    return RegionConfig(
+        name=f"{prop.city}, {prop.state}" if prop.city and prop.state else "Unknown",
+        center_lat=lat,
+        center_lng=lng,
+        radius_miles=5.0,
+        min_beds=max(1, (prop.beds or 1) - 1),
+        max_beds=min(10, (prop.beds or 3) + 2),
+        min_price=0,
+        max_price=5_000_000,
     )
 
-    # ── Step 3: AI — Build financial model ───────────────────────────────
-    print(f"[{analysis_id}] Step 3: Building financial model")
-    financial_model = await _build_financial_model(
-        property_data, comps, strategy, renovation_budget, notes
+
+async def _gather_str_comps(
+    browser: BrowserManager,
+    cache: ScraperCache,
+    region: RegionConfig,
+) -> list[STRComp]:
+    """Scrape Airbnb and VRBO for STR comps near the subject property."""
+    comps: list[STRComp] = []
+
+    try:
+        airbnb = AirbnbScraper(browser, cache)
+        airbnb_comps = await airbnb.scrape(region)
+        comps.extend(airbnb_comps)
+        print(f"  Airbnb: {len(airbnb_comps)} comps")
+    except Exception as e:
+        print(f"  Airbnb scraping error (non-fatal): {e}")
+
+    try:
+        vrbo = VRBOScraper(browser, cache)
+        vrbo_comps = await vrbo.scrape(region)
+        comps.extend(vrbo_comps)
+        print(f"  VRBO: {len(vrbo_comps)} comps")
+    except Exception as e:
+        print(f"  VRBO scraping error (non-fatal): {e}")
+
+    return comps
+
+
+def _build_market_from_comps(comps: list[STRComp], prop: PropertyListing) -> MarketMetrics:
+    """Build a MarketMetrics object from scraped STR comps."""
+    if not comps:
+        beds = prop.beds or 3
+        return MarketMetrics(
+            market_id="fallback",
+            market_name=f"{prop.city}, {prop.state}",
+            adr=float(150 + beds * 40),
+            occupancy_rate=0.65,
+            revpar=float((150 + beds * 40) * 0.65),
+            active_listing_count=0,
+        )
+
+    rates = [c.nightly_rate_avg for c in comps if c.nightly_rate_avg and c.nightly_rate_avg > 50]
+    occs = [c.occupancy_rate for c in comps if c.occupancy_rate and c.occupancy_rate > 0.1]
+
+    adr = statistics.median(rates) if rates else 180.0
+    occ = statistics.median(occs) if occs else 0.65
+
+    return MarketMetrics(
+        market_id="comp_derived",
+        market_name=f"{prop.city}, {prop.state}",
+        adr=adr,
+        occupancy_rate=occ,
+        revpar=adr * occ,
+        active_listing_count=len(comps),
     )
 
-    # ── Step 4: AI — Write market narrative ──────────────────────────────
-    print(f"[{analysis_id}] Step 4: Writing market narrative")
-    market_narrative = await _write_market_narrative(property_data, comps, financial_model)
 
-    # ── Step 5: AI — Generate pitch deck content ──────────────────────────
-    print(f"[{analysis_id}] Step 5: Generating pitch deck")
-    pitch_deck = await _generate_pitch_deck(property_data, financial_model, market_narrative)
+def _map_to_db_format(result: AnalysisResult) -> dict:
+    """Map AnalysisResult to the flat + reportJson dict the DB/frontend expects."""
+    prop = result.property
+    rev = result.revenue_estimate
+    metrics = result.investment_metrics
 
-    # ── Step 6: AI — Scope renovation ────────────────────────────────────
-    print(f"[{analysis_id}] Step 6: Scoping renovation")
-    reno_scope = await _scope_renovation(
-        property_data, property_type, renovation_budget, financial_model
-    )
+    conv = metrics.get("Conventional") or (next(iter(metrics.values())) if metrics else None)
 
-    # ── Step 7: Determine verdict ─────────────────────────────────────────
-    verdict = _determine_verdict(financial_model)
+    if conv:
+        annual_expenses = conv.annual_expenses
+        financing = conv.financing
+        beo = conv.break_even_occupancy * 100
+    else:
+        annual_expenses = 0.0
+        financing = None
+        beo = 0.0
 
-    print(f"[{analysis_id}] Pipeline complete. Verdict: {verdict}")
+    base_rev = rev.moderate_revenue
+    cons_rev = rev.conservative_revenue
+    agg_rev = rev.aggressive_revenue
+
+    # Scale variable expenses (~35% variable with revenue)
+    fixed_exp = annual_expenses * 0.65
+    var_exp = annual_expenses * 0.35
+
+    def scale_exp(r: float) -> float:
+        return fixed_exp + var_exp * (r / base_rev if base_rev > 0 else 1.0)
+
+    cons_exp = scale_exp(cons_rev)
+    agg_exp = scale_exp(agg_rev)
+
+    noi_base = base_rev - annual_expenses
+    noi_cons = cons_rev - cons_exp
+    noi_agg = agg_rev - agg_exp
+
+    annual_debt = (financing.monthly_payment * 12) if financing else 0.0
+    total_cash = financing.total_cash_needed if financing else 1.0
+    purchase_price = financing.purchase_price if financing else (prop.list_price or 1)
+
+    def coc(noi: float) -> float:
+        return ((noi - annual_debt) / total_cash * 100) if total_cash > 0 else 0.0
+
+    def cap(noi: float) -> float:
+        return (noi / purchase_price * 100) if purchase_price > 0 else 0.0
+
+    def irr_est(coc_val: float) -> float:
+        return coc_val + 2.5
+
+    adr_base = rev.primary_adr
+    adr_cons = rev.conservative_adr
+    adr_agg = rev.aggressive_adr
+    occ_base = rev.primary_occupancy * 100
+    occ_cons = rev.conservative_occupancy * 100
+    occ_agg = rev.aggressive_occupancy * 100
+
+    coc_base = coc(noi_base)
+    coc_cons = coc(noi_cons)
+    coc_agg = coc(noi_agg)
+
+    financial_model = {
+        "gross_revenue_base": int(base_rev),
+        "gross_revenue_conservative": int(cons_rev),
+        "gross_revenue_optimistic": int(agg_rev),
+        "operating_expenses_base": int(annual_expenses),
+        "operating_expenses_conservative": int(cons_exp),
+        "operating_expenses_optimistic": int(agg_exp),
+        "noi_base": int(noi_base),
+        "noi_conservative": int(noi_cons),
+        "noi_optimistic": int(noi_agg),
+        "coc_return_base": round(coc_base, 1),
+        "coc_return_conservative": round(coc_cons, 1),
+        "coc_return_optimistic": round(coc_agg, 1),
+        "cap_rate_base": round(cap(noi_base), 1),
+        "cap_rate_conservative": round(cap(noi_cons), 1),
+        "cap_rate_optimistic": round(cap(noi_agg), 1),
+        "irr_base": round(irr_est(coc_base), 1),
+        "irr_conservative": round(irr_est(coc_cons), 1),
+        "irr_optimistic": round(irr_est(coc_agg), 1),
+        "adr_base": int(adr_base),
+        "adr_conservative": int(adr_cons),
+        "adr_optimistic": int(adr_agg),
+        "occupancy_base": round(occ_base, 1),
+        "occupancy_conservative": round(occ_cons, 1),
+        "occupancy_optimistic": round(occ_agg, 1),
+        "breakeven_occupancy": round(beo, 1),
+        "down_payment_assumed": int(financing.down_payment) if financing else 0,
+        "mortgage_rate_assumed": round(financing.interest_rate * 100, 2) if financing else 0,
+        "mortgage_payment_monthly": int(financing.monthly_payment) if financing else 0,
+        "assumptions": (
+            f"Conventional 30-yr fixed at {financing.interest_rate*100:.1f}% with "
+            f"{financing.down_payment/purchase_price*100:.0f}% down "
+            f"(${financing.down_payment:,.0f}). "
+            f"Revenue based on {len(result.str_comps)} STR comps in the area."
+        ) if financing else "Default financing assumptions applied.",
+    }
+
+    renovation_scope: list[dict] = []
+    if result.scope_of_work:
+        priority_map = {"must_have": "high", "high_impact": "medium", "nice_to_have": "low"}
+        for rec in result.scope_of_work.recommendations:
+            avg_cost = (rec.estimated_cost_low + rec.estimated_cost_high) / 2
+            renovation_scope.append({
+                "category": rec.category,
+                "item": rec.recommendation,
+                "estimated_cost": int(avg_cost),
+                "roi_impact": priority_map.get(rec.priority, "medium"),
+                "notes": rec.reasoning,
+            })
+
+    comps_data = [c.model_dump(mode="json") for c in result.str_comps[:20]]
+
+    verdict = _determine_verdict(coc_base, irr_est(coc_base))
 
     return {
-        "address": property_data.get("address"),
-        "city": property_data.get("city"),
-        "state": property_data.get("state"),
-        "zip": property_data.get("zip"),
-        "listPrice": property_data.get("list_price"),
-        "beds": property_data.get("beds"),
-        "baths": property_data.get("baths"),
-        "sqft": property_data.get("sqft"),
+        "address": prop.address,
+        "city": prop.city,
+        "state": prop.state,
+        "zip": prop.zip_code,
+        "listPrice": prop.list_price,
+        "beds": prop.beds,
+        "baths": prop.baths,
+        "sqft": prop.sqft,
         "verdict": verdict,
-        "projRevenue": financial_model.get("gross_revenue_base"),
-        "cocReturn": financial_model.get("coc_return_base"),
-        "capRate": financial_model.get("cap_rate_base"),
-        "irr": financial_model.get("irr_base"),
-        "occupancy": financial_model.get("occupancy_base"),
-        "noi": financial_model.get("noi_base"),
-        "adr": financial_model.get("adr_base"),
+        "projRevenue": int(base_rev),
+        "cocReturn": round(coc_base, 1),
+        "capRate": round(cap(noi_base), 1),
+        "irr": round(irr_est(coc_base), 1),
+        "occupancy": round(occ_base, 1),
+        "noi": int(noi_base),
+        "adr": int(adr_base),
         "reportJson": {
             "financialModel": financial_model,
-            "marketNarrative": market_narrative,
-            "pitchDeck": pitch_deck,
-            "renovationScope": reno_scope,
-            "comps": comps,
-            "property": property_data,
+            "marketNarrative": result.investment_narrative or "",
+            "renovationScope": renovation_scope,
+            "comps": comps_data,
+            "property": prop.model_dump(mode="json"),
         },
     }
 
 
-async def _build_financial_model(
-    property_data: dict,
-    comps: dict,
-    strategy: str,
-    renovation_budget: Optional[int],
-    notes: Optional[str],
-) -> dict:
-    prompt = f"""You are an expert STR investment analyst. Build a detailed financial model.
-
-PROPERTY:
-{json.dumps(property_data, indent=2)}
-
-STR COMPS (1-mile radius):
-{json.dumps(comps, indent=2)}
-
-INVESTOR CONTEXT:
-- Strategy: {strategy}
-- Renovation budget: ${renovation_budget:,} if renovation_budget else 'None specified'
-- Notes: {notes or 'None'}
-
-Return a JSON object with these exact keys (numbers only, no $ signs or % signs):
-{{
-  "gross_revenue_base": <int, annual>,
-  "gross_revenue_conservative": <int>,
-  "gross_revenue_optimistic": <int>,
-  "operating_expenses_base": <int>,
-  "operating_expenses_conservative": <int>,
-  "operating_expenses_optimistic": <int>,
-  "noi_base": <int>,
-  "noi_conservative": <int>,
-  "noi_optimistic": <int>,
-  "coc_return_base": <float, e.g. 14.7>,
-  "coc_return_conservative": <float>,
-  "coc_return_optimistic": <float>,
-  "cap_rate_base": <float>,
-  "cap_rate_conservative": <float>,
-  "cap_rate_optimistic": <float>,
-  "irr_base": <float, 10-year>,
-  "irr_conservative": <float>,
-  "irr_optimistic": <float>,
-  "adr_base": <int, nightly rate>,
-  "adr_conservative": <int>,
-  "adr_optimistic": <int>,
-  "occupancy_base": <float, e.g. 74.2>,
-  "occupancy_conservative": <float>,
-  "occupancy_optimistic": <float>,
-  "breakeven_occupancy": <float>,
-  "down_payment_assumed": <int>,
-  "mortgage_rate_assumed": <float>,
-  "mortgage_payment_monthly": <int>,
-  "assumptions": <string, 2-3 sentences>
-}}
-
-Assume 20% down payment and 7.25% 30-year fixed mortgage unless notes specify otherwise.
-Return ONLY valid JSON.
-"""
-
-    message = await client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=2000,
-        messages=[{"role": "user", "content": prompt}],
-    )
-
-    text = message.content[0].text  # type: ignore
-    # Extract JSON from response
-    start = text.find("{")
-    end = text.rfind("}") + 1
-    return json.loads(text[start:end])
-
-
-async def _write_market_narrative(
-    property_data: dict,
-    comps: dict,
-    financial_model: dict,
-) -> str:
-    prompt = f"""You are a senior STR investment analyst writing a market narrative for an investor report.
-
-PROPERTY: {property_data.get('address')}, {property_data.get('city')}, {property_data.get('state')}
-LIST PRICE: ${property_data.get('list_price', 0):,}
-FINANCIAL MODEL (base case): CoC {financial_model.get('coc_return_base')}%, NOI ${financial_model.get('noi_base', 0):,}, Occupancy {financial_model.get('occupancy_base')}%
-STR COMPS: {json.dumps(comps, indent=2)}
-
-Write a 3-paragraph investment narrative covering:
-1. Why this market works for STR (demand drivers, seasonality, regulation)
-2. Why this specific property has an edge (features that command a premium ADR)
-3. Risk factors and how they're mitigated
-
-Tone: authoritative, data-driven, institutional. No fluff. This is for sophisticated investors.
-Write in plain text (no markdown headers). 3 paragraphs separated by double newlines.
-"""
-
-    message = await client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=800,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    return message.content[0].text  # type: ignore
-
-
-async def _generate_pitch_deck(
-    property_data: dict,
-    financial_model: dict,
-    market_narrative: str,
-) -> list[dict]:
-    """Returns structured content for each of the 8 pitch deck slides."""
-    prompt = f"""You are creating slide content for an 8-slide STR investment pitch deck.
-
-PROPERTY: {property_data.get('address')}, {property_data.get('city')}, {property_data.get('state')}
-KEY METRICS: CoC {financial_model.get('coc_return_base')}%, Revenue ${financial_model.get('gross_revenue_base', 0):,}/yr, Price ${property_data.get('list_price', 0):,}
-MARKET NARRATIVE: {market_narrative[:500]}
-
-Return a JSON array of 8 slide objects. Each object: {{ "slide": <int>, "title": <str>, "headline": <str>, "bullets": [<str>, ...] (max 4), "callout": <str or null> }}
-
-Slides: 1=Cover, 2=Executive Summary, 3=Market Overview, 4=Property Details, 5=Financial Scenarios, 6=Revenue Projections, 7=Highlights & Risks, 8=Next Steps
-
-Return ONLY valid JSON array.
-"""
-
-    message = await client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=2000,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    text = message.content[0].text  # type: ignore
-    start = text.find("[")
-    end = text.rfind("]") + 1
-    return json.loads(text[start:end])
-
-
-async def _scope_renovation(
-    property_data: dict,
-    property_type: str,
-    renovation_budget: Optional[int],
-    financial_model: dict,
-) -> list[dict]:
-    budget_note = f"Target budget: ${renovation_budget:,}" if renovation_budget else "No budget specified — recommend optimal scope."
-    prompt = f"""You are an STR renovation specialist. Create a line-item scope of work optimized for STR revenue maximization.
-
-PROPERTY: {property_data.get('address')} — {property_type}, {property_data.get('beds')} bed / {property_data.get('baths')} bath, {property_data.get('sqft')} sqft
-{budget_note}
-Current ADR target: ${financial_model.get('adr_base')}/night
-
-Return a JSON array of renovation line items. Each item: {{ "category": <str>, "item": <str>, "estimated_cost": <int>, "roi_impact": "high"|"medium"|"low", "notes": <str> }}
-
-Categories: Interior, Kitchen, Bathrooms, Outdoor/Pool, Tech/Smart Home, Photography/Launch, Contingency
-
-Prioritize by STR ROI impact. Return ONLY valid JSON array.
-"""
-
-    message = await client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=1500,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    text = message.content[0].text  # type: ignore
-    start = text.find("[")
-    end = text.rfind("]") + 1
-    return json.loads(text[start:end])
-
-
-def _determine_verdict(financial_model: dict) -> str:
-    coc = financial_model.get("coc_return_base", 0)
-    irr = financial_model.get("irr_base", 0)
-
+def _determine_verdict(coc: float, irr: float) -> str:
     if coc >= 14 and irr >= 16:
         return "STRONG_BUY"
     elif coc >= 10 and irr >= 12:

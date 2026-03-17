@@ -1,0 +1,1 @@
+"""Continuous property monitoring subsystem."""
