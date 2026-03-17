@@ -14,6 +14,7 @@ const badgeVariants = cva(
         purple: "bg-[#EDE9FE] text-[#6357A0]",
         dark: "bg-[#111111] text-white",
         "strong-buy": "bg-[#16A34A] text-white uppercase tracking-wider",
+        "buy": "bg-[#65A30D] text-white uppercase tracking-wider",
         "hold": "bg-[#B8943F] text-white uppercase tracking-wider",
         "pass": "bg-[#DC2626] text-white uppercase tracking-wider",
       },
