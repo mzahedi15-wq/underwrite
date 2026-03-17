@@ -39,33 +39,36 @@ export async function POST(req: Request) {
 
   const user = await getOrCreateUser(clerkId);
 
-  // Enforce plan limits
-  const now = new Date();
-  const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
-  const usedThisMonth = await db.analysis.count({
-    where: { userId: user.id, createdAt: { gte: startOfMonth } },
-  });
+  // Enforce plan limits only when Stripe is configured
+  const stripeEnabled = !!process.env.STRIPE_SECRET_KEY;
+  if (stripeEnabled) {
+    const now = new Date();
+    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+    const usedThisMonth = await db.analysis.count({
+      where: { userId: user.id, createdAt: { gte: startOfMonth } },
+    });
 
-  const limits: Record<string, number> = {
-    FREE: 1,
-    STARTER: 3,
-    PRO: 10,
-    UNLIMITED: Infinity,
-  };
+    const limits: Record<string, number> = {
+      FREE: 1,
+      STARTER: 3,
+      PRO: 10,
+      UNLIMITED: Infinity,
+    };
 
-  const totalEver = await db.analysis.count({ where: { userId: user.id } });
-  if (user.plan === "FREE" && totalEver >= 1) {
-    return NextResponse.json(
-      { error: "Free plan limit reached. Upgrade to continue." },
-      { status: 403 }
-    );
-  }
+    const totalEver = await db.analysis.count({ where: { userId: user.id } });
+    if (user.plan === "FREE" && totalEver >= 1) {
+      return NextResponse.json(
+        { error: "Free plan limit reached. Upgrade to continue." },
+        { status: 403 }
+      );
+    }
 
-  if (user.plan !== "FREE" && usedThisMonth >= limits[user.plan]) {
-    return NextResponse.json(
-      { error: `${user.plan} plan limit of ${limits[user.plan]} analyses/month reached.` },
-      { status: 403 }
-    );
+    if (user.plan !== "FREE" && usedThisMonth >= limits[user.plan]) {
+      return NextResponse.json(
+        { error: `${user.plan} plan limit of ${limits[user.plan]} analyses/month reached.` },
+        { status: 403 }
+      );
+    }
   }
 
   const body = await req.json();
