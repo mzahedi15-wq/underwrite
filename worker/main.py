@@ -73,13 +73,20 @@ async def _run_pipeline(req: AnalysisRequest):
 
 async def _update_analysis(analysis_id: str, data: dict):
     url = f"{NEXT_APP_URL}/api/analyses/{analysis_id}"
-    async with httpx.AsyncClient() as client:
-        await client.patch(
-            url,
-            json=data,
-            headers={"x-worker-secret": WORKER_SECRET},
-            timeout=10,
-        )
+    print(f"[{analysis_id}] Callback PATCH {url} → status={data.get('status')}")
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.patch(
+                url,
+                json=data,
+                headers={"x-worker-secret": WORKER_SECRET},
+                timeout=10,
+            )
+            print(f"[{analysis_id}] Callback response: {resp.status_code}")
+            if resp.status_code >= 400:
+                print(f"[{analysis_id}] Callback body: {resp.text[:500]}")
+    except Exception as e:
+        print(f"[{analysis_id}] Callback FAILED: {e}")
 
 
 def _now() -> str:

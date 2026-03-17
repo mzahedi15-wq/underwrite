@@ -14,12 +14,49 @@ from playwright.async_api import (
 )
 try:
     from playwright_stealth import Stealth
+
+    _STEALTH_AVAILABLE = True
 except (ImportError, ModuleNotFoundError):
-    # playwright-stealth requires pkg_resources (setuptools) which may be absent
-    # in slim Python images. Fall back to a no-op so the worker still starts.
+    _STEALTH_AVAILABLE = False
+
     class Stealth:  # type: ignore[no-redef]
+        """Lightweight fallback when playwright-stealth can't load."""
+
+        _INIT_SCRIPT = """
+        // Hide webdriver flag
+        Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+        // Mock chrome runtime
+        window.chrome = {runtime: {}, loadTimes: function(){}, csi: function(){}};
+        // Override plugins to look real
+        Object.defineProperty(navigator, 'plugins', {
+            get: () => {
+                const arr = [
+                    {name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer'},
+                    {name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai'},
+                    {name: 'Native Client', filename: 'internal-nacl-plugin'},
+                ];
+                arr.item = i => arr[i];
+                arr.namedItem = n => arr.find(p => p.name === n);
+                arr.refresh = () => {};
+                return arr;
+            }
+        });
+        // Override languages
+        Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+        // Override permissions query
+        const origQuery = window.navigator.permissions.query;
+        window.navigator.permissions.query = (params) =>
+            params.name === 'notifications'
+                ? Promise.resolve({state: Notification.permission})
+                : origQuery(params);
+        // Prevent iframe contentWindow detection
+        Object.defineProperty(HTMLIFrameElement.prototype, 'contentWindow', {
+            get: function() {return window;}
+        });
+        """
+
         async def apply_stealth_async(self, page) -> None:
-            pass
+            await page.add_init_script(self._INIT_SCRIPT)
 
 from str_researcher.utils.logging import get_logger
 from str_researcher.utils.rate_limiter import RateLimiter
