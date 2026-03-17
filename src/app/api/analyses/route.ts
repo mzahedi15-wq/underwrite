@@ -93,8 +93,12 @@ export async function POST(req: Request) {
 
   // Dispatch to Python worker
   try {
-    const workerUrl = process.env.WORKER_URL;
+    let workerUrl = process.env.WORKER_URL;
     if (workerUrl) {
+      // Ensure protocol prefix exists
+      if (!workerUrl.startsWith("http://") && !workerUrl.startsWith("https://")) {
+        workerUrl = `https://${workerUrl}`;
+      }
       fetch(`${workerUrl}/analyze`, {
         method: "POST",
         headers: {
@@ -102,12 +106,14 @@ export async function POST(req: Request) {
           "X-Worker-Secret": process.env.WORKER_SECRET ?? "",
         },
         body: JSON.stringify({ analysisId: analysis.id, propertyUrl, propertyType, strategy, renovationBudget, notes }),
-      }).catch(() => {
-        // Fire-and-forget — worker errors are handled via status polling
+      }).catch((err) => {
+        console.error("[WORKER DISPATCH ERROR]", err);
       });
+    } else {
+      console.error("[WORKER DISPATCH] WORKER_URL is not set");
     }
-  } catch {
-    // Worker dispatch failure doesn't block the response
+  } catch (err) {
+    console.error("[WORKER DISPATCH ERROR]", err);
   }
 
   return NextResponse.json(analysis, { status: 201 });
