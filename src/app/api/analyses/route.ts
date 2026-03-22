@@ -91,24 +91,24 @@ export async function POST(req: Request) {
     },
   });
 
-  // Dispatch to Python worker
+  // Dispatch to Python worker (must await — Vercel kills the function after response)
   try {
     let workerUrl = process.env.WORKER_URL;
     if (workerUrl) {
-      // Ensure protocol prefix exists
       if (!workerUrl.startsWith("http://") && !workerUrl.startsWith("https://")) {
         workerUrl = `https://${workerUrl}`;
       }
-      fetch(`${workerUrl}/analyze`, {
+      const workerResp = await fetch(`${workerUrl}/analyze`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           "X-Worker-Secret": process.env.WORKER_SECRET ?? "",
         },
         body: JSON.stringify({ analysisId: analysis.id, propertyUrl, propertyType, strategy, renovationBudget, notes }),
-      }).catch((err) => {
-        console.error("[WORKER DISPATCH ERROR]", err);
       });
+      if (!workerResp.ok) {
+        console.error("[WORKER DISPATCH] Response:", workerResp.status, await workerResp.text());
+      }
     } else {
       console.error("[WORKER DISPATCH] WORKER_URL is not set");
     }
